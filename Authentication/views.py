@@ -202,20 +202,35 @@ def login_view(request):
         status=405
     )
     
+def _save_user_health_profile(user, data):
+    weight = data.get('weight', user.weight)
+    height = data.get('height', user.height)
+    conditions = data.get('conditions', user.conditions)
+
+    if weight is not None:
+        weight = float(weight)
+        if weight < 20 or weight > 300:
+            raise ValueError("Weight must be between 20 and 300 kg")
+
+    if height is not None:
+        height = float(height)
+        if height < 100 or height > 250:
+            raise ValueError("Height must be between 100 and 250 cm")
+
+    user.weight = weight
+    user.height = height
+    user.conditions = conditions
+    user.bmi = round(weight / ((height / 100) ** 2), 1) if weight and height else None
+    user.save()
+
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def update_onboarding(request):
     try:
         user = request.user
-        data = request.data
-        
-        user.weight = data.get('weight', user.weight)
-        user.height = data.get('height', user.height)
-        user.bmi = data.get('bmi', user.bmi)
-        user.conditions = data.get('conditions', user.conditions)
-        
-        user.save()
-        
+        _save_user_health_profile(user, request.data)
+
         return Response({
             "message": "Onboarding data updated successfully",
             "user": {
@@ -228,8 +243,39 @@ def update_onboarding(request):
                 "conditions": user.conditions
             }
         }, status=status.HTTP_200_OK)
+    except ValueError as e:
+        return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
     except Exception as e:
         logger.error(f"Error updating onboarding data: {str(e)}")
+        return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(["PATCH", "PUT"])
+@permission_classes([IsAuthenticated])
+def update_profile_health(request):
+    """Allow users to add or edit onboarding health data later from profile."""
+    try:
+        user = request.user
+        _save_user_health_profile(user, request.data)
+        return Response(
+            {
+                "message": "Profile health data updated successfully",
+                "user": {
+                    "unique_id": str(user.unique_id),
+                    "email": user.email,
+                    "full_name": user.full_name,
+                    "weight": user.weight,
+                    "height": user.height,
+                    "bmi": user.bmi,
+                    "conditions": user.conditions,
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+    except ValueError as e:
+        return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as e:
+        logger.error(f"Error updating profile health data: {str(e)}")
         return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 @api_view(["GET"])
