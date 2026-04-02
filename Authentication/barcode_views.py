@@ -139,9 +139,19 @@ def barcode_scan_api(request):
         # 7. Save to History
         history = History.objects.create(
             user=request.user,
+            ingredients_result=ingredients_score,
+            nutrition_result=nutrition_score,
             total_result=total_score,
             nutrition_data=formatted_nutrition,
-            ingredients_data={"ingredients": ingredients_list, "ai_analysis": ai_analysis},
+            ingredients_data={
+                "ingredients": ingredients_list,
+                "ai_analysis": ai_analysis,
+                "product_meta": {
+                    "name": off_data.get("name", "Unknown Product"),
+                    "brand": off_data.get("brand", "Unknown Brand"),
+                    "image": off_data.get("image_front_url", ""),
+                },
+            },
             analysis_summary=analysis_summary
         )
 
