@@ -28,6 +28,7 @@ class CustomUserManager(BaseUserManager):
 
 class User(AbstractUser):
     unique_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    clerk_id = models.CharField(max_length=255, null=True, blank=True)
     full_name = models.CharField(max_length=100, null=True, blank=True)
     email = models.EmailField(unique=True)
     password = models.CharField(max_length=100)

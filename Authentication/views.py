@@ -224,6 +224,51 @@ def _save_user_health_profile(user, data):
     user.save()
 
 
+def _update_profile_identity(user, data):
+    allowed_fields = {"email", "full_name"}
+    provided_fields = {key for key in data.keys() if key in allowed_fields}
+    unsupported_fields = set(data.keys()) - allowed_fields
+
+    if unsupported_fields:
+        raise ValueError("Only email and full_name can be updated on this endpoint")
+
+    if not provided_fields:
+        raise ValueError("At least one of email or full_name is required")
+
+    updates = []
+
+    if "email" in provided_fields:
+        email = (data.get("email") or "").strip().lower()
+        if not email:
+            raise ValueError("Email cannot be empty")
+        try:
+            validate_email(email)
+        except ValidationError:
+            raise ValueError("Invalid email address")
+
+        email_in_use = User.objects.filter(email__iexact=email).exclude(pk=user.pk).exists()
+        if email_in_use:
+            raise ValueError("Email already registered")
+
+        if user.email != email:
+            user.email = email
+            updates.append("email")
+
+    if "full_name" in provided_fields:
+        full_name = (data.get("full_name") or "").strip()
+        if not full_name:
+            raise ValueError("Full name cannot be empty")
+
+        if user.full_name != full_name:
+            user.full_name = full_name
+            updates.append("full_name")
+
+    if updates:
+        user.save(update_fields=updates)
+
+    return user
+
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def update_onboarding(request):
@@ -278,7 +323,7 @@ def update_profile_health(request):
         logger.error(f"Error updating profile health data: {str(e)}")
         return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-@api_view(["GET"])
+@api_view(["GET", "PATCH"])
 @permission_classes([IsAuthenticated])
 def get_profile_view(request):
     try:
@@ -289,6 +334,12 @@ def get_profile_view(request):
                 {"message": "User Profile does not exist"},
                 status=status.HTTP_404_NOT_FOUND,
             )
+
+        if request.method == "PATCH":
+            try:
+                userprofile = _update_profile_identity(userprofile, request.data)
+            except ValueError as e:
+                return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
         serializer = UserSerializer(userprofile)
         return Response(serializer.data, status=status.HTTP_200_OK)
