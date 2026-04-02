@@ -923,6 +923,7 @@ def get_user_history(request):
         start_date = request.query_params.get('start_date')
         end_date = request.query_params.get('end_date')
         limit = request.query_params.get('limit', 10)  # Default to 10 records
+        include_ai = str(request.query_params.get('include_ai', '0')).lower() in {'1', 'true', 'yes'}
         
         # Query the user's history, ordered by most recent first
         history_query = History.objects.filter(user=request.user).order_by('-created_at')
@@ -943,8 +944,11 @@ def get_user_history(request):
         # Format the history data
         history_data = []
         for record in history_query:
-            ai_analysis = record.ingredients_data.get('ai_analysis') if isinstance(record.ingredients_data, dict) else None
-            if not ai_analysis:
+            ai_analysis = None
+            if include_ai and isinstance(record.ingredients_data, dict):
+                ai_analysis = record.ingredients_data.get('ai_analysis')
+
+            if include_ai and not ai_analysis:
                 ai_analysis = generate_ai_analysis(
                     ingredients_list=(record.ingredients_data or {}).get('raw_data') or (record.ingredients_data or {}).get('ingredients') or [],
                     nutrition_data=record.nutrition_data or {},
@@ -953,7 +957,7 @@ def get_user_history(request):
                     total_score=record.total_result or 0,
                     user=request.user,
                 )
-            history_data.append({
+            item = {
                 'id': record.id,
                 'created_at': record.created_at.strftime('%Y-%m-%d %H:%M:%S'),
                 'scores': {
@@ -964,8 +968,12 @@ def get_user_history(request):
                 'nutrition_data': record.nutrition_data,
                 'ingredients_data': record.ingredients_data,
                 'analysis_summary': record.analysis_summary,
-                'ai_analysis': ai_analysis,
-            })
+            }
+
+            if include_ai:
+                item['ai_analysis'] = ai_analysis
+
+            history_data.append(item)
         
         return JsonResponse({
             'success': True,
