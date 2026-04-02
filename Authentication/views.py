@@ -460,6 +460,48 @@ import google.generativeai as genai
 from django.conf import settings
 from django.http import JsonResponse
 
+AI_ANALYSIS_FALLBACK = {
+    "diet_type": {"label": "Unknown", "reason": "Unable to determine diet type."},
+    "overall_verdict": {
+        "title": "Moderate fit",
+        "tone": "neutral",
+        "text": "This product should be consumed with moderation based on the available data.",
+    },
+    "summary": {
+        "headline": "AI summary unavailable",
+        "intro": "Detailed AI analysis could not be generated for this product.",
+        "positives": [],
+        "concerns": [],
+        "recommendation": "Review the ingredient list and nutrition values manually before deciding.",
+    },
+    "health_insights": [],
+    "ingredient_analysis": [],
+}
+
+
+def _get_profile_context(user):
+    if not user or not getattr(user, "is_authenticated", False):
+        return {}
+
+    return {
+        "weight": getattr(user, "weight", None),
+        "height": getattr(user, "height", None),
+        "bmi": getattr(user, "bmi", None),
+        "conditions": getattr(user, "conditions", []) or [],
+    }
+
+
+def _extract_json_block(text):
+    if not text:
+        return None
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    return text[start:end + 1]
+
 def generate_analysis_summary(ingredients_list, nutrition_data, ingredients_score, nutrition_score, total_score):
     """
     Generate an analysis summary using Gemini AI based on ingredients list, 
@@ -529,6 +571,91 @@ def generate_analysis_summary(ingredients_list, nutrition_data, ingredients_scor
     except Exception as e:
         logger.error(f"Error generating analysis summary: {str(e)}")
         return f"This product received a {category} health score of {total_score:.1f}/10."
+
+
+def generate_ai_analysis(ingredients_list, nutrition_data, ingredients_score, nutrition_score, total_score, user=None):
+    try:
+        genai.configure(api_key=settings.GEMINI_API_KEY)
+        model = genai.GenerativeModel('gemini-2.0-flash')
+
+        ingredients_text = ", ".join(ingredients_list) if isinstance(ingredients_list, list) else str(ingredients_list)
+        profile_context = _get_profile_context(user)
+
+        prompt = f"""
+        You are a nutrition analyst. Return ONLY valid JSON with no markdown fences and no extra text.
+
+        Product ingredients:
+        {ingredients_text}
+
+        Nutrition facts JSON:
+        {json.dumps(nutrition_data, indent=2)}
+
+        Scoring:
+        - ingredients_score: {ingredients_score:.2f}
+        - nutrition_score: {nutrition_score:.2f}
+        - total_score: {total_score:.2f}
+
+        User health profile:
+        {json.dumps(profile_context, indent=2)}
+
+        Required JSON schema:
+        {{
+          "diet_type": {{
+            "label": "Veg or Non-Veg or Unknown",
+            "reason": "short explanation"
+          }},
+          "overall_verdict": {{
+            "title": "short title",
+            "tone": "good or neutral or warning",
+            "text": "one sentence on whether the product is good for the user"
+          }},
+          "summary": {{
+            "headline": "short headline",
+            "intro": "2-3 sentence natural summary",
+            "positives": ["max 3 short bullets"],
+            "concerns": ["max 3 short bullets"],
+            "recommendation": "one sentence recommendation"
+          }},
+          "health_insights": [
+            {{
+              "label": "condition area",
+              "tone": "good or warning",
+              "text": "specific personalized insight"
+            }}
+          ],
+          "ingredient_analysis": [
+            {{
+              "name": "ingredient name exactly as supplied",
+              "tone": "good or warning",
+              "label": "Healthy or Not Good For You",
+              "reason": "short reason"
+            }}
+          ]
+        }}
+
+        Rules:
+        - Use the user's health conditions if present.
+        - Ingredient analysis must classify every provided ingredient.
+        - Prefer green/good or red/warning classifications. Avoid neutral unless absolutely necessary.
+        - If an ingredient is unclear, classify conservatively based on the provided user context.
+        - Keep text concise and user-facing.
+        """
+
+        response = model.generate_content(prompt)
+        raw_text = getattr(response, "text", "") or ""
+        json_block = _extract_json_block(raw_text)
+        parsed = json.loads(json_block) if json_block else None
+
+        if not isinstance(parsed, dict):
+            raise ValueError("Gemini did not return valid JSON")
+
+        return {
+            **AI_ANALYSIS_FALLBACK,
+            **parsed,
+        }
+    except Exception as e:
+        logger.error(f"Error generating AI analysis: {str(e)}")
+        return AI_ANALYSIS_FALLBACK.copy()
     
 
 from django.http import JsonResponse
@@ -703,25 +830,6 @@ def result_api(request):
             "cholesterol": nutrition_result.cholesterol_100g,
         }
         
-        ingredients_data = {
-            "raw_data": ingredients_list
-        }
-
-        # Save to history with all structured data
-        try:
-            history = History.objects.create(
-                user=request.user,
-                ingredients_result=ingredients_score,
-                nutrition_result=nutrition_score,
-                total_result=total_score,
-                nutrition_data=nutrition_data,
-                ingredients_data=ingredients_data
-            )
-            history_id = history.id
-        except Exception as history_error:
-            logger.error(f"Failed to save to history: {str(history_error)}")
-            history_id = None
-
         # Format data for response
         formatted_nutrition_data = {
             "Calories": nutrition_result.calories,
@@ -734,26 +842,49 @@ def result_api(request):
             "Trans Fat (g)": nutrition_result.trans_fat_100g,
             "Cholesterol (mg)": nutrition_result.cholesterol_100g,
         }
-        
+
         try:
-        # Generate analysis summary
+            ai_analysis = generate_ai_analysis(
+                ingredients_list=ingredients_list,
+                nutrition_data=formatted_nutrition_data,
+                ingredients_score=ingredients_score,
+                nutrition_score=nutrition_score,
+                total_score=total_score,
+                user=request.user,
+            )
             analysis_summary = generate_analysis_summary(
-            ingredients_list=ingredients_list,
-            nutrition_data=formatted_nutrition_data,
-            ingredients_score=ingredients_score,
-            nutrition_score=nutrition_score,
-            total_score=total_score
-        )   
-            # Update history object with summary
-            if history_id:
-                history = History.objects.get(id=history_id)
-                history.analysis_summary = analysis_summary
-                history.save()
+                ingredients_list=ingredients_list,
+                nutrition_data=formatted_nutrition_data,
+                ingredients_score=ingredients_score,
+                nutrition_score=nutrition_score,
+                total_score=total_score
+            )
         except Exception as summary_error:
             logger.error(f"Failed to generate or save analysis summary: {str(summary_error)}")
             analysis_summary = f"This product received a score of {total_score:.1f}/10."
-        
-# Modify the return statement to include the summary
+            ai_analysis = AI_ANALYSIS_FALLBACK.copy()
+
+        ingredients_data = {
+            "raw_data": ingredients_list,
+            "ai_analysis": ai_analysis,
+        }
+
+        # Save to history with all structured data
+        try:
+            history = History.objects.create(
+                user=request.user,
+                ingredients_result=ingredients_score,
+                nutrition_result=nutrition_score,
+                total_result=total_score,
+                nutrition_data=nutrition_data,
+                ingredients_data=ingredients_data,
+                analysis_summary=analysis_summary,
+            )
+            history_id = history.id
+        except Exception as history_error:
+            logger.error(f"Failed to save to history: {str(history_error)}")
+            history_id = None
+
         return JsonResponse({
             'success': True,
             'history_id': history_id,
@@ -766,8 +897,9 @@ def result_api(request):
                 'score': nutrition_score  # Add nutrition score
             },
             'total_score': total_score,
-        'analysis_summary': analysis_summary,  # Add this line
-        'timestamp': timezone.now().strftime('%Y-%m-%d %H:%M:%S')
+            'analysis_summary': analysis_summary,
+            'ai_analysis': ai_analysis,
+            'timestamp': timezone.now().strftime('%Y-%m-%d %H:%M:%S')
         })
 
     except Exception as e:
@@ -811,6 +943,16 @@ def get_user_history(request):
         # Format the history data
         history_data = []
         for record in history_query:
+            ai_analysis = record.ingredients_data.get('ai_analysis') if isinstance(record.ingredients_data, dict) else None
+            if not ai_analysis:
+                ai_analysis = generate_ai_analysis(
+                    ingredients_list=(record.ingredients_data or {}).get('raw_data') or (record.ingredients_data or {}).get('ingredients') or [],
+                    nutrition_data=record.nutrition_data or {},
+                    ingredients_score=record.ingredients_result or 0,
+                    nutrition_score=record.nutrition_result or 0,
+                    total_score=record.total_result or 0,
+                    user=request.user,
+                )
             history_data.append({
                 'id': record.id,
                 'created_at': record.created_at.strftime('%Y-%m-%d %H:%M:%S'),
@@ -821,7 +963,8 @@ def get_user_history(request):
                 },
                 'nutrition_data': record.nutrition_data,
                 'ingredients_data': record.ingredients_data,
-                'analysis_summary': record.analysis_summary  # Add this line
+                'analysis_summary': record.analysis_summary,
+                'ai_analysis': ai_analysis,
             })
         
         return JsonResponse({
@@ -938,45 +1081,6 @@ def manual_entry_api(request):
             "cholesterol": nutrition_input.get('cholesterol'),
         }
         
-        ingredients_data = {
-            "raw_data": ingredients_list
-        }
-
-        # Save to history with all structured data
-        try:
-            history = History.objects.create(
-                user=request.user,
-                ingredients_result=ingredients_score,
-                nutrition_result=nutrition_score,
-                total_result=total_score,
-                nutrition_data=nutrition_data_for_storage,
-                ingredients_data=ingredients_data,
-            )
-            history_id = history.id
-            
-            # Generate and update analysis summary
-            analysis_summary = generate_analysis_summary(
-                ingredients_list=ingredients_list,
-                nutrition_data=nutrition_data_for_storage,
-                ingredients_score=ingredients_score,
-                nutrition_score=nutrition_score,
-                total_score=total_score
-            )
-            
-            # Update the history record with the summary
-            history.analysis_summary = analysis_summary
-            history.save()
-            
-            logger.info(f"Successfully created history entry with ID: {history_id}")
-            
-        except Exception as history_error:
-            logger.error(f"Failed to save to history: {str(history_error)}")
-            return JsonResponse({
-                'success': False,
-                'error': f'Failed to save results: {str(history_error)}'
-            }, status=500)
-
-        # Format data for response
         formatted_nutrition_data = {
             "Calories": nutrition_input.get('calories'),
             "Protein (g)": nutrition_input.get('protein'),
@@ -990,23 +1094,51 @@ def manual_entry_api(request):
         }
 
         try:
-        # Generate analysis summary
+            ai_analysis = generate_ai_analysis(
+                ingredients_list=ingredients_list,
+                nutrition_data=formatted_nutrition_data,
+                ingredients_score=ingredients_score,
+                nutrition_score=nutrition_score,
+                total_score=total_score,
+                user=request.user,
+            )
             analysis_summary = generate_analysis_summary(
-            ingredients_list=ingredients_list,
-            nutrition_data=formatted_nutrition_data,
-            ingredients_score=ingredients_score,
-            nutrition_score=nutrition_score,
-            total_score=total_score
-        )       # Update history object with summary
-            if history_id:
-                history = History.objects.get(id=history_id)
-                history.analysis_summary = analysis_summary
-                history.save()
+                ingredients_list=ingredients_list,
+                nutrition_data=formatted_nutrition_data,
+                ingredients_score=ingredients_score,
+                nutrition_score=nutrition_score,
+                total_score=total_score
+            )
         except Exception as summary_error:
             logger.error(f"Failed to generate or save analysis summary: {str(summary_error)}")
             analysis_summary = f"This product received a score of {total_score:.1f}/10."
+            ai_analysis = AI_ANALYSIS_FALLBACK.copy()
 
-# Modify the return statement to include the summary
+        ingredients_data = {
+            "raw_data": ingredients_list,
+            "ai_analysis": ai_analysis,
+        }
+
+        # Save to history with all structured data
+        try:
+            history = History.objects.create(
+                user=request.user,
+                ingredients_result=ingredients_score,
+                nutrition_result=nutrition_score,
+                total_result=total_score,
+                nutrition_data=nutrition_data_for_storage,
+                ingredients_data=ingredients_data,
+                analysis_summary=analysis_summary,
+            )
+            history_id = history.id
+            logger.info(f"Successfully created history entry with ID: {history_id}")
+        except Exception as history_error:
+            logger.error(f"Failed to save to history: {str(history_error)}")
+            return JsonResponse({
+                'success': False,
+                'error': f'Failed to save results: {str(history_error)}'
+            }, status=500)
+
         return JsonResponse({
             'success': True,
             'history_id': history_id,
@@ -1019,7 +1151,8 @@ def manual_entry_api(request):
             'score': nutrition_score  # Add nutrition score
         },
         'total_score': total_score,
-        'analysis_summary': analysis_summary,  # Add this line
+        'analysis_summary': analysis_summary,
+        'ai_analysis': ai_analysis,
         'timestamp': timezone.now().strftime('%Y-%m-%d %H:%M:%S')
         })
 

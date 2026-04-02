@@ -5,7 +5,7 @@ from rest_framework.decorators import api_view, permission_classes, parser_class
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser
 from .models import History
-from .views import generate_analysis_summary, load_pickle_file
+from .views import AI_ANALYSIS_FALLBACK, generate_ai_analysis, generate_analysis_summary, load_pickle_file
 from .openfoodfacts_service import fetch_product_from_barcode
 import os
 import pandas as pd
@@ -101,15 +101,6 @@ def barcode_scan_api(request):
         # Calculate Total
         total_score = (ingredients_score + nutrition_score) / 2.0
         
-        # 6. Generate Summary
-        analysis_summary = generate_analysis_summary(
-            ingredients_list=ingredients_list,
-            nutrition_data=nutrition_data,
-            ingredients_score=ingredients_score,
-            nutrition_score=nutrition_score,
-            total_score=total_score
-        )
-
         formatted_nutrition = {
             "Calories": nutrition_data["Calories"],
             "Protein (g)": nutrition_data["Protein (g)"],
@@ -122,6 +113,27 @@ def barcode_scan_api(request):
             "Cholesterol (mg)": nutrition_data["Cholesterol (mg)"]
         }
 
+        try:
+            ai_analysis = generate_ai_analysis(
+                ingredients_list=ingredients_list,
+                nutrition_data=formatted_nutrition,
+                ingredients_score=ingredients_score,
+                nutrition_score=nutrition_score,
+                total_score=total_score,
+                user=request.user,
+            )
+            analysis_summary = generate_analysis_summary(
+                ingredients_list=ingredients_list,
+                nutrition_data=nutrition_data,
+                ingredients_score=ingredients_score,
+                nutrition_score=nutrition_score,
+                total_score=total_score
+            )
+        except Exception as e:
+            logger.error(f"AI analysis error: {str(e)}")
+            ai_analysis = AI_ANALYSIS_FALLBACK.copy()
+            analysis_summary = f"This product received a score of {total_score:.1f}/10."
+
         from django.utils import timezone
 
         # 7. Save to History
@@ -129,7 +141,7 @@ def barcode_scan_api(request):
             user=request.user,
             total_result=total_score,
             nutrition_data=formatted_nutrition,
-            ingredients_data={"ingredients": ingredients_list},
+            ingredients_data={"ingredients": ingredients_list, "ai_analysis": ai_analysis},
             analysis_summary=analysis_summary
         )
 
@@ -146,6 +158,7 @@ def barcode_scan_api(request):
             },
             'total_score': total_score,
             'analysis_summary': analysis_summary,
+            'ai_analysis': ai_analysis,
             'product_name': off_data.get("name", "Unknown Product"),
             'product_image': off_data.get("image_front_url", ""),
             'product_brand': off_data.get("brand", "Unknown Brand"),
